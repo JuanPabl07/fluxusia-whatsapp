@@ -4,32 +4,37 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from sqlalchemy.orm import Session
 import json
 from datetime import datetime
+import os # Import os para os.getenv, embora o token principal venha de settings
 
 from app.gateway import whatsapp_handler
 from app.nlp import processor as nlp_processor
 from app.core import task_manager
-# Use the new getter for SessionLocal and the initialization function
 from app.db.database import initialize_database, get_session_local, get_engine, create_db_and_tables
 from app.models import models # Import models to ensure Base is populated
+# WHATSAPP_VERIFY_TOKEN é importado daqui. Ele deve internamente usar os.getenv("VERIFY_TOKEN")
 from config.settings import WHATSAPP_VERIFY_TOKEN, DATABASE_URL
 
-# Initialize the database with the default URL when the app starts
-# This will set up the main `engine` and `SessionLocal` for the app
+# Inicializa o banco de dados com a URL padrão quando o app inicia
 initialize_database(DATABASE_URL)
 
-# If you need to create tables on app startup (for production/dev, not tests):
-# create_db_and_tables(get_engine()) 
-# For MVP, we are letting tests handle table creation in their own context.
+# Se precisar criar tabelas na inicialização (para prod/dev, não testes):
+# create_db_and_tables(get_engine())
 
 app = FastAPI(
     title="IA WhatsApp Assistant MVP",
     description="MVP para um assistente de IA no WhatsApp para gerenciamento de rotina.",
-    version="0.1.2" # Incremented version
+    version="0.1.2" # Versão incrementada
 )
 
-# Dependency to get DB session
+# Loga o token esperado no escopo global para verificar se config.settings o carregou corretamente
+if WHATSAPP_VERIFY_TOKEN:
+    print(f"[LOG INICIAL] WHATSAPP_VERIFY_TOKEN (de config.settings) no escopo global: 	'{WHATSAPP_VERIFY_TOKEN}' (Tipo: {type(WHATSAPP_VERIFY_TOKEN)})")
+else:
+    # Este é um ponto crítico. Se WHATSAPP_VERIFY_TOKEN for None aqui, a variável de ambiente VERIFY_TOKEN não foi lida corretamente por config.settings.py
+    print(f"[LOG INICIAL ERRO CRÍTICO] WHATSAPP_VERIFY_TOKEN (de config.settings) é None ou vazio. Verifique a variável de ambiente VERIFY_TOKEN no Render e o arquivo config/settings.py.")
+
+# Dependência para obter a sessão do DB
 def get_db_session():
-    # Use the getter to ensure SessionLocal is initialized
     CurrentSessionLocal = get_session_local()
     db = CurrentSessionLocal()
     try:
@@ -43,15 +48,42 @@ async def read_root():
 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
+    print("--- NOVA TENTATIVA DE VERIFICACAO DO WEBHOOK RECEBIDA ---")
+    
+    # WHATSAPP_VERIFY_TOKEN já foi carregado no escopo global a partir de config.settings
+    # Vamos logar seu valor e tipo aqui para confirmação no momento da chamada.
+    print(f"[DENTRO DO WEBHOOK GET] Token esperado (de config.settings via WHATSAPP_VERIFY_TOKEN): 	'{WHATSAPP_VERIFY_TOKEN}' (Tipo: {type(WHATSAPP_VERIFY_TOKEN)})")
+
     mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
+    token_recebido = request.query_params.get("hub.verify_token") # Este é o token que a Meta envia
     challenge = request.query_params.get("hub.challenge")
-    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-        print(f"WEBHOOK_VERIFIED: {challenge}")
-        return int(challenge)
+
+    print(f"[DENTRO DO WEBHOOK GET] Modo recebido da Meta: 			'{mode}' (Tipo: {type(mode)})")
+    print(f"[DENTRO DO WEBHOOK GET] Token recebido da Meta (hub.verify_token): 	'{token_recebido}' (Tipo: {type(token_recebido)})")
+    print(f"[DENTRO DO WEBHOOK GET] Challenge recebido da Meta: 		'{challenge}' (Tipo: {type(challenge)})")
+
+    # Verificações adicionais para depuração
+    if WHATSAPP_VERIFY_TOKEN is None:
+        print("[ERRO DE CONFIGURACAO] WHATSAPP_VERIFY_TOKEN (de config.settings) é None DENTRO da função verify_webhook. Isso não deveria acontecer se o log inicial mostrou um valor.")
+    if token_recebido is None:
+        print("[AVISO] Token recebido da Meta (hub.verify_token) é None. A Meta não enviou o token?")
+
+    # Vamos comparar e logar o resultado da comparação
+    comparacao_modo = (mode == "subscribe")
+    # A comparação crucial:
+    comparacao_token = (str(token_recebido) == str(WHATSAPP_VERIFY_TOKEN)) # Convertendo para string para garantir a comparação correta, caso um seja None ou de tipo diferente
+    
+    print(f"[DENTRO DO WEBHOOK GET] Resultado da comparacao (mode == 'subscribe'): 		{comparacao_modo}")
+    print(f"[DENTRO DO WEBHOOK GET] Resultado da comparacao (token_recebido == WHATSAPP_VERIFY_TOKEN): 	{comparacao_token}")
+
+    if comparacao_modo and comparacao_token and WHATSAPP_VERIFY_TOKEN is not None and token_recebido is not None:
+        print(f"SUCESSO NA VERIFICACAO DO WEBHOOK! Retornando challenge: {challenge}")
+        return int(challenge) # Meta espera um int
     else:
-        print("WEBHOOK_VERIFICATION_FAILED")
-        raise HTTPException(status_code=403, detail="Verification token mismatch")
+        print(f"FALHA NA VERIFICACAO DO WEBHOOK. Detalhes das comparações acima. HTTP 403 será retornado.")
+        # Para depuração, vamos logar os tokens novamente caso a comparação falhe, para ter certeza.
+        print(f"Reconfirmando para falha: Token Recebido da Meta: '{token_recebido}', Token Esperado (de config.settings): '{WHATSAPP_VERIFY_TOKEN}'")
+        raise HTTPException(status_code=403, detail="Token de verificação inválido ou erro de configuração interna.")
 
 @app.post("/webhook")
 async def handle_whatsapp_message(request: Request, db: Session = Depends(get_db_session)):
@@ -77,7 +109,7 @@ async def handle_whatsapp_message(request: Request, db: Session = Depends(get_db
         response_text = ("Olá! Sou sua assistente de rotina pessoal. "
                          "Posso te ajudar a organizar suas tarefas e mais. "
                          "Você concorda em receber minhas mensagens e utilizar meus serviços? "
-                         "Responda 'Sim' para continuar ou 'Não' para cancelar.") # Corrected quote
+                         "Responda 'Sim' para continuar ou 'Não' para cancelar.")
         whatsapp_handler.send_whatsapp_message(user_whatsapp_id, response_text)
         return {"status": "new_user_prompted_for_opt_in"}
 
@@ -122,7 +154,7 @@ async def handle_whatsapp_message(request: Request, db: Session = Depends(get_db
 
     elif intent == "list_tasks":
         date_filter = entities.get("date_filter", "hoje")
-        tasks = task_manager.get_tasks_by_user(db, user_whatsapp_id, status="pending")
+        tasks = task_manager.get_tasks_by_user(db, user_whatsapp_id, status="pending") # Filtrando por 'pending'
         if tasks:
             response_text = f"Suas tarefas pendentes ({date_filter}):\n"
             for i, task in enumerate(tasks):
